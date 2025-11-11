@@ -760,9 +760,80 @@ Format the response professionally with clear sections and bullet points. Keep i
         else:
             return None, f"⚠️ Error generating LLM interpretation: {error_msg}. Please check your API key configuration and quota tier."
 
+def convert_to_serializable(obj):
+    """Convert numpy types and other non-serializable objects to Python native types"""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (list, tuple)):
+        return [convert_to_serializable(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {key: convert_to_serializable(value) for key, value in obj.items()}
+    elif pd.isna(obj):
+        return None
+    elif hasattr(obj, '__dict__'):
+        # Skip complex objects like sklearn models
+        return str(type(obj).__name__)
+    else:
+        return obj
+
 def generate_downloadable_report(llm_text, model_performance, forecast_results, 
                                  data_summary, supply_chain_metrics):
     """Generate downloadable report"""
+    # Convert forecast_results to serializable format
+    serializable_forecast_results = {}
+    for model_name, model_data in forecast_results.items():
+        serializable_forecast_results[model_name] = {}
+        for key, value in model_data.items():
+            if key == 'model_info':
+                # Skip model_info as it contains sklearn models
+                serializable_forecast_results[model_name][key] = "Model object (skipped in report)"
+            elif key in ['test_forecast', 'future_forecast']:
+                # Convert numpy arrays to lists
+                serializable_forecast_results[model_name][key] = convert_to_serializable(value)
+            elif key in ['mape', 'wape', 'rmse', 'mae', 'r2']:
+                # Convert numpy floats
+                if pd.isna(value) or np.isnan(value):
+                    serializable_forecast_results[model_name][key] = None
+                else:
+                    serializable_forecast_results[model_name][key] = float(value)
+            elif key == 'params_used':
+                # Convert params_used (may contain numpy types)
+                serializable_forecast_results[model_name][key] = convert_to_serializable(value)
+            else:
+                serializable_forecast_results[model_name][key] = convert_to_serializable(value)
+    
+    # Format forecast results as readable text instead of JSON
+    forecast_text = ""
+    for model_name, model_data in serializable_forecast_results.items():
+        forecast_text += f"\n### {model_name}\n"
+        
+        mape_val = model_data.get('mape')
+        forecast_text += f"- MAPE: {mape_val:.2f}%\n" if mape_val is not None and not pd.isna(mape_val) else "- MAPE: N/A\n"
+        
+        wape_val = model_data.get('wape')
+        forecast_text += f"- WAPE: {wape_val:.2f}%\n" if wape_val is not None and not pd.isna(wape_val) else "- WAPE: N/A\n"
+        
+        rmse_val = model_data.get('rmse')
+        forecast_text += f"- RMSE: ${rmse_val:.2f}\n" if rmse_val is not None and not pd.isna(rmse_val) else "- RMSE: N/A\n"
+        
+        mae_val = model_data.get('mae')
+        forecast_text += f"- MAE: ${mae_val:.2f}\n" if mae_val is not None and not pd.isna(mae_val) else "- MAE: N/A\n"
+        
+        r2_val = model_data.get('r2')
+        forecast_text += f"- R²: {r2_val:.3f}\n" if r2_val is not None and not pd.isna(r2_val) else "- R²: N/A\n"
+        
+        if 'future_forecast' in model_data and model_data['future_forecast']:
+            try:
+                forecasts = [float(f) for f in model_data['future_forecast']]
+                forecast_text += f"- Future Forecasts: {', '.join([f'${f:,.2f}' for f in forecasts])}\n"
+            except (ValueError, TypeError):
+                forecast_text += f"- Future Forecasts: {model_data['future_forecast']}\n"
+        forecast_text += "\n"
+    
     report = f"""
 # Sales Forecasting Analysis Report
 Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
@@ -776,14 +847,14 @@ This report presents a comprehensive analysis of sales forecasting for a new bev
 - Sales trend: {data_summary['trend']}
 - Seasonality: {data_summary['has_seasonality']}
 
-## Model Performance
+## Model Performance Metrics
 {json.dumps(model_performance, indent=2)}
 
 ## Forecast Results
-{json.dumps(forecast_results, indent=2)}
+{forecast_text}
 
 ## Supply Chain Metrics
-{supply_chain_metrics if supply_chain_metrics else 'Not calculated'}
+{json.dumps(supply_chain_metrics, indent=2) if supply_chain_metrics and isinstance(supply_chain_metrics, dict) else (supply_chain_metrics if supply_chain_metrics else 'Not calculated')}
 
 ## AI-Generated Analysis
 {llm_text if llm_text else 'Not available'}
