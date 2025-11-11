@@ -639,7 +639,51 @@ def get_gemini_interpretation(model_performance, forecast_results, data_summary,
             return None, "⚠️ Google Generative AI library not installed. Install with: pip install google-generativeai"
         
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-pro')
+        
+        # Try to get available models first, then use the best one for free tier
+        model = None
+        model_name_used = None
+        
+        try:
+            # List available models
+            available_models = []
+            for m in genai.list_models():
+                if 'generateContent' in m.supported_generation_methods:
+                    model_display_name = m.display_name or m.name
+                    available_models.append(m.name)
+            
+            # Prefer models in this order (best for free tier first)
+            preferred_models = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
+            
+            for preferred_model in preferred_models:
+                # Check if model name matches (handle different naming formats like 'models/gemini-1.5-flash')
+                matching_models = [m for m in available_models 
+                                  if preferred_model.replace('-', '') in m.replace('-', '').replace('models/', '').lower() 
+                                  or preferred_model in m.replace('models/', '').lower()]
+                if matching_models:
+                    model_name_used = matching_models[0]
+                    # Use the full model name from API (might include 'models/' prefix)
+                    model = genai.GenerativeModel(model_name_used)
+                    break
+            
+            # If no preferred model found, use first available
+            if model is None and available_models:
+                model_name_used = available_models[0]
+                model = genai.GenerativeModel(model_name_used)
+                
+        except Exception as e:
+            # Fallback: try common model names directly
+            model_names = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
+            for model_name in model_names:
+                try:
+                    model = genai.GenerativeModel(model_name)
+                    model_name_used = model_name
+                    break
+                except:
+                    continue
+        
+        if model is None:
+            return None, "⚠️ Could not find a compatible Gemini model. Please check your API key, quota tier, and ensure you have access to Gemini models. Free tier typically supports 'gemini-1.5-flash'."
         
         # Prepare comprehensive prompt
         prompt = f"""
@@ -694,11 +738,27 @@ Please provide a comprehensive analysis report covering:
 Format the response professionally with clear sections and bullet points. Keep it comprehensive but concise (800-1000 words).
 """
         
-        response = model.generate_content(prompt)
-        return response.text, None
+        # Generate content with error handling
+        try:
+            response = model.generate_content(prompt)
+            return response.text, None
+        except Exception as e:
+            error_msg = str(e)
+            # Provide helpful error message
+            if "404" in error_msg or "not found" in error_msg.lower():
+                return None, f"⚠️ Model not available. Error: {error_msg}. Try using gemini-1.5-flash or gemini-1.5-pro. Check your API quota tier."
+            elif "quota" in error_msg.lower() or "429" in error_msg:
+                return None, f"⚠️ API quota exceeded. Error: {error_msg}. Please check your Gemini API quota limits."
+            else:
+                return None, f"⚠️ Error generating LLM interpretation: {error_msg}. Please check your API key configuration."
         
     except Exception as e:
-        return None, f"⚠️ Error generating LLM interpretation: {str(e)}. Please check your API key configuration."
+        error_msg = str(e)
+        # Try to provide helpful debugging info
+        if "API key" in error_msg or "authentication" in error_msg.lower():
+            return None, f"⚠️ Authentication error: {error_msg}. Please verify your GEMINI_API_KEY is correct."
+        else:
+            return None, f"⚠️ Error generating LLM interpretation: {error_msg}. Please check your API key configuration and quota tier."
 
 def generate_downloadable_report(llm_text, model_performance, forecast_results, 
                                  data_summary, supply_chain_metrics):
