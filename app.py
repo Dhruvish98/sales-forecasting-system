@@ -1029,9 +1029,22 @@ def generate_pdf_report(llm_text, model_performance, forecast_results, data_summ
     elements.append(Paragraph("Forecast Results", heading_style))
     forecast_text = ""
     for model_name, model_data in forecast_results.items():
-        if 'future_forecast' in model_data and model_data['future_forecast']:
-            forecasts = [float(f) for f in model_data['future_forecast']]
-            forecast_text += f"<b>{model_name}:</b> {', '.join([f'${f:,.2f}' for f in forecasts])}<br/>"
+        if 'future_forecast' in model_data:
+            future_forecast = model_data['future_forecast']
+            # Handle numpy arrays and lists
+            if isinstance(future_forecast, np.ndarray):
+                if len(future_forecast) > 0:
+                    forecasts = [float(f) for f in future_forecast]
+                    forecast_text += f"<b>{model_name}:</b> {', '.join([f'${f:,.2f}' for f in forecasts])}<br/>"
+            elif isinstance(future_forecast, (list, tuple)):
+                if len(future_forecast) > 0:
+                    forecasts = [float(f) for f in future_forecast]
+                    forecast_text += f"<b>{model_name}:</b> {', '.join([f'${f:,.2f}' for f in forecasts])}<br/>"
+            elif future_forecast:  # For scalar values
+                try:
+                    forecast_text += f"<b>{model_name}:</b> ${float(future_forecast):,.2f}<br/>"
+                except (ValueError, TypeError):
+                    pass
     elements.append(Paragraph(forecast_text or "No forecasts available", styles['Normal']))
     elements.append(Spacer(1, 0.2*inch))
     
