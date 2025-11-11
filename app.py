@@ -7,10 +7,24 @@ from datetime import datetime, timedelta
 import warnings
 import json
 import io
+import base64
 from scipy import stats
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.tsa.stattools import adfuller
 warnings.filterwarnings('ignore')
+
+# PDF generation
+try:
+    from reportlab.lib.pagesizes import letter, A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle, PageBreak
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT, TA_JUSTIFY
+    from PIL import Image as PILImage
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
 
 # Forecasting models
 from statsmodels.tsa.arima.model import ARIMA
@@ -626,6 +640,147 @@ def calculate_eoq(demand, ordering_cost, holding_cost):
 
 # ==================== LLM INTEGRATION (GEMINI) ====================
 
+def get_gemini_audience_specific_report(model_performance, forecast_results, data_summary, 
+                                       supply_chain_metrics=None, audience="Management"):
+    """Get LLM interpretation tailored to specific audience"""
+    try:
+        api_key = os.getenv('GEMINI_API_KEY') or st.secrets.get('GEMINI_API_KEY', None)
+        
+        if not api_key:
+            return None, "⚠️ LLM interpretation requires Gemini API key. Please set GEMINI_API_KEY in environment variables or Streamlit secrets."
+        
+        if not GEMINI_AVAILABLE:
+            return None, "⚠️ Google Generative AI library not installed. Install with: pip install google-generativeai"
+        
+        genai.configure(api_key=api_key)
+        
+        # Try to get available models first, then use the best one for free tier
+        model = None
+        model_name_used = None
+        
+        try:
+            # List available models
+            available_models = []
+            for m in genai.list_models():
+                if 'generateContent' in m.supported_generation_methods:
+                    available_models.append(m.name)
+            
+            # Prefer models in this order (best for free tier first)
+            preferred_models = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
+            
+            for preferred_model in preferred_models:
+                matching_models = [m for m in available_models 
+                                  if preferred_model.replace('-', '') in m.replace('-', '').replace('models/', '').lower() 
+                                  or preferred_model in m.replace('models/', '').lower()]
+                if matching_models:
+                    model_name_used = matching_models[0]
+                    model = genai.GenerativeModel(model_name_used)
+                    break
+            
+            if model is None and available_models:
+                model_name_used = available_models[0]
+                model = genai.GenerativeModel(model_name_used)
+                
+        except Exception as e:
+            # Fallback: try common model names directly
+            model_names = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
+            for model_name in model_names:
+                try:
+                    model = genai.GenerativeModel(model_name)
+                    model_name_used = model_name
+                    break
+                except:
+                    continue
+        
+        if model is None:
+            return None, "⚠️ Could not find a compatible Gemini model."
+        
+        # Audience-specific prompts
+        audience_prompts = {
+            "Management": """
+You are writing a report for C-level executives and senior management. Focus on:
+- High-level business insights and strategic implications
+- Financial impact and ROI considerations
+- Risk assessment and mitigation strategies
+- Actionable recommendations for decision-making
+- Key performance indicators and metrics
+- Executive summary with clear takeaways
+Avoid technical jargon. Use business language. Emphasize what matters for strategic planning and resource allocation.
+""",
+            "Technical": """
+You are writing a report for data scientists, ML engineers, and technical teams. Focus on:
+- Detailed model performance analysis and comparison
+- Technical methodology and algorithms used
+- Feature engineering and model architecture details
+- Statistical significance and validation metrics
+- Model limitations and assumptions
+- Recommendations for model improvement
+Include technical details, code considerations, and deep dive into model mechanics.
+""",
+            "Supply Chain": """
+You are writing a report for supply chain managers, operations teams, and logistics professionals. Focus on:
+- Inventory planning and optimization recommendations
+- Production scheduling and capacity planning
+- Safety stock and reorder point analysis
+- Distribution and logistics implications
+- Demand variability and supply chain risks
+- Operational efficiency improvements
+- Cost optimization opportunities
+Use supply chain terminology and focus on operational execution.
+"""
+        }
+        
+        audience_context = audience_prompts.get(audience, audience_prompts["Management"])
+        
+        # Prepare comprehensive prompt
+        prompt = f"""
+You are an expert consultant analyzing sales forecasting results for a beverage company launching a new flavored water product.
+
+**AUDIENCE:** {audience}
+{audience_context}
+
+**DATA SUMMARY:**
+- Total months of historical data: {data_summary['total_months']}
+- Average monthly sales: ${data_summary['avg_sales']:,.0f}
+- Sales trend: {data_summary['trend']}
+- Seasonality detected: {data_summary['has_seasonality']}
+- Data variance: {data_summary.get('variance', 'N/A')}
+
+**MODEL PERFORMANCE METRICS:**
+{json.dumps(model_performance, indent=2)}
+
+**FORECAST RESULTS:**
+- Best performing model: {forecast_results.get('best_model', 'N/A')}
+- Next 3 months forecasts: {forecast_results.get('best_forecasts', [])}
+- Forecast confidence: {forecast_results.get('confidence', 'N/A')}
+
+**SUPPLY CHAIN METRICS:**
+{supply_chain_metrics if supply_chain_metrics else 'Not calculated'}
+
+Generate a comprehensive, audience-appropriate report (1000-1200 words) that addresses the specific needs and concerns of {audience} professionals. 
+Use clear sections, professional formatting, and actionable insights relevant to this audience.
+"""
+        
+        # Generate content with error handling
+        try:
+            response = model.generate_content(prompt)
+            return response.text, None
+        except Exception as e:
+            error_msg = str(e)
+            if "404" in error_msg or "not found" in error_msg.lower():
+                return None, f"⚠️ Model not available. Error: {error_msg}."
+            elif "quota" in error_msg.lower() or "429" in error_msg:
+                return None, f"⚠️ API quota exceeded. Error: {error_msg}."
+            else:
+                return None, f"⚠️ Error generating report: {error_msg}."
+        
+    except Exception as e:
+        error_msg = str(e)
+        if "API key" in error_msg or "authentication" in error_msg.lower():
+            return None, f"⚠️ Authentication error: {error_msg}."
+        else:
+            return None, f"⚠️ Error generating report: {error_msg}."
+
 def get_gemini_interpretation(model_performance, forecast_results, data_summary, 
                               supply_chain_metrics=None):
     """Get LLM interpretation using Google Gemini"""
@@ -779,6 +934,165 @@ def convert_to_serializable(obj):
         return str(type(obj).__name__)
     else:
         return obj
+
+def fig_to_image(fig):
+    """Convert matplotlib figure to PIL Image"""
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+    buf.seek(0)
+    img = PILImage.open(buf)
+    return img
+
+def generate_pdf_report(llm_text, model_performance, forecast_results, data_summary, 
+                       supply_chain_metrics, audience, figures_dict=None):
+    """Generate PDF report with visualizations"""
+    if not PDF_AVAILABLE:
+        return None, "PDF generation libraries not installed. Install with: pip install reportlab Pillow"
+    
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, 
+                           rightMargin=72, leftMargin=72,
+                           topMargin=72, bottomMargin=18)
+    
+    # Container for the 'Flowable' objects
+    elements = []
+    
+    # Define styles
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=24,
+        textColor=colors.HexColor('#1f77b4'),
+        spaceAfter=30,
+        alignment=TA_CENTER
+    )
+    
+    heading_style = ParagraphStyle(
+        'CustomHeading',
+        parent=styles['Heading2'],
+        fontSize=16,
+        textColor=colors.HexColor('#1f77b4'),
+        spaceAfter=12,
+        spaceBefore=12
+    )
+    
+    # Title
+    elements.append(Paragraph("Sales Forecasting Analysis Report", title_style))
+    elements.append(Spacer(1, 0.2*inch))
+    elements.append(Paragraph(f"<b>Audience:</b> {audience}", styles['Normal']))
+    elements.append(Paragraph(f"<b>Generated on:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
+    elements.append(Spacer(1, 0.3*inch))
+    
+    # Executive Summary
+    elements.append(Paragraph("Executive Summary", heading_style))
+    elements.append(Paragraph(
+        "This report presents a comprehensive analysis of sales forecasting for a new beverage product "
+        "using multiple forecasting models, tailored for " + audience.lower() + " professionals.",
+        styles['Normal']
+    ))
+    elements.append(Spacer(1, 0.2*inch))
+    
+    # Data Overview
+    elements.append(Paragraph("Data Overview", heading_style))
+    data_text = f"""
+    <b>Total months of data:</b> {data_summary['total_months']}<br/>
+    <b>Average monthly sales:</b> ${data_summary['avg_sales']:,.0f}<br/>
+    <b>Sales trend:</b> {data_summary['trend']}<br/>
+    <b>Seasonality:</b> {data_summary['has_seasonality']}<br/>
+    """
+    elements.append(Paragraph(data_text, styles['Normal']))
+    elements.append(Spacer(1, 0.2*inch))
+    
+    # Model Performance
+    elements.append(Paragraph("Model Performance Metrics", heading_style))
+    perf_data = [['Model'] + list(list(model_performance.values())[0].keys())]
+    for model_name, metrics in model_performance.items():
+        row = [model_name] + [str(v) for v in metrics.values()]
+        perf_data.append(row)
+    
+    perf_table = Table(perf_data)
+    perf_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black)
+    ]))
+    elements.append(perf_table)
+    elements.append(Spacer(1, 0.3*inch))
+    
+    # Forecast Results
+    elements.append(Paragraph("Forecast Results", heading_style))
+    forecast_text = ""
+    for model_name, model_data in forecast_results.items():
+        if 'future_forecast' in model_data and model_data['future_forecast']:
+            forecasts = [float(f) for f in model_data['future_forecast']]
+            forecast_text += f"<b>{model_name}:</b> {', '.join([f'${f:,.2f}' for f in forecasts])}<br/>"
+    elements.append(Paragraph(forecast_text or "No forecasts available", styles['Normal']))
+    elements.append(Spacer(1, 0.2*inch))
+    
+    # Add visualizations if available
+    if figures_dict:
+        elements.append(Paragraph("Visualizations", heading_style))
+        for fig_name, fig in figures_dict.items():
+            if fig:
+                try:
+                    img = fig_to_image(fig)
+                    img_width = 6 * inch
+                    img_height = img.height * (img_width / img.width)
+                    # Limit height
+                    if img_height > 4 * inch:
+                        img_height = 4 * inch
+                        img_width = img.width * (img_height / img.height)
+                    
+                    img_buffer = io.BytesIO()
+                    img.save(img_buffer, format='PNG')
+                    img_buffer.seek(0)
+                    
+                    elements.append(Paragraph(f"<b>{fig_name}</b>", styles['Normal']))
+                    elements.append(Image(img_buffer, width=img_width, height=img_height))
+                    elements.append(Spacer(1, 0.2*inch))
+                except Exception as e:
+                    elements.append(Paragraph(f"Could not include {fig_name}: {str(e)}", styles['Normal']))
+    
+    # Supply Chain Metrics
+    if supply_chain_metrics:
+        elements.append(Paragraph("Supply Chain Metrics", heading_style))
+        sc_text = "<br/>".join([f"<b>{k}:</b> {v}" for k, v in supply_chain_metrics.items()])
+        elements.append(Paragraph(sc_text, styles['Normal']))
+        elements.append(Spacer(1, 0.2*inch))
+    
+    # AI-Generated Analysis
+    elements.append(PageBreak())
+    elements.append(Paragraph("AI-Generated Analysis", heading_style))
+    
+    # Split LLM text into paragraphs
+    llm_paragraphs = llm_text.split('\n\n')
+    for para in llm_paragraphs:
+        para = para.strip()
+        if para:
+            # Check if it's a heading
+            if para.startswith('**') and para.endswith('**'):
+                para = para.replace('**', '')
+                elements.append(Paragraph(f"<b>{para}</b>", styles['Heading3']))
+            elif para.startswith('#'):
+                para = para.replace('#', '').strip()
+                elements.append(Paragraph(f"<b>{para}</b>", styles['Heading3']))
+            else:
+                # Clean markdown formatting
+                para = para.replace('**', '<b>').replace('**', '</b>')
+                para = para.replace('*', '').replace('_', '')
+                elements.append(Paragraph(para, styles['Normal']))
+            elements.append(Spacer(1, 0.1*inch))
+    
+    # Build PDF
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer.getvalue(), None
 
 def generate_downloadable_report(llm_text, model_performance, forecast_results, 
                                  data_summary, supply_chain_metrics):
@@ -1714,10 +2028,148 @@ if df is not None:
                 st.markdown("### AI-Generated Analysis Report")
                 st.markdown(st.session_state.llm_report)
                 
-                # Download report
-                st.subheader("Download Report")
+                # Download report section
+                st.subheader("📥 Download Report")
+                
+                # Audience selection
+                audience = st.selectbox(
+                    "Select Report Audience",
+                    ["Management", "Technical", "Supply Chain"],
+                    help="Choose the target audience for the report. The LLM will tailor the content accordingly."
+                )
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # Generate audience-specific report
+                    if st.button(f"🤖 Generate {audience} Report", type="primary"):
+                        with st.spinner(f"Generating {audience}-specific report..."):
+                            results = st.session_state.forecast_results
+                            valid_models = {k: v for k, v in results.items() if not np.isnan(v['mape'])}
+                            best_model_name = min(valid_models.items(), key=lambda x: x[1]['mape'])[0] if valid_models else None
+                            
+                            forecast_results_for_llm = {
+                                'best_model': best_model_name,
+                                'best_forecasts': [f"${f:,.2f}" for f in results[best_model_name]['future_forecast']] if best_model_name else [],
+                                'confidence': 'High' if results[best_model_name]['mape'] < 10 else 'Medium' if results[best_model_name]['mape'] < 20 else 'Low' if best_model_name else 'N/A'
+                            }
+                            
+                            supply_chain_metrics = st.session_state.get('supply_chain_metrics', None)
+                            
+                            llm_text_audience, error = get_gemini_audience_specific_report(
+                                st.session_state.model_performance,
+                                forecast_results_for_llm,
+                                data_summary,
+                                supply_chain_metrics,
+                                audience
+                            )
+                            
+                            if error:
+                                st.error(error)
+                            else:
+                                st.session_state[f'llm_report_{audience.lower()}'] = llm_text_audience
+                                st.session_state['current_audience'] = audience
+                                st.success(f"✅ {audience} report generated!")
+                                st.markdown(f"### {audience}-Specific Analysis")
+                                st.markdown(llm_text_audience)
+                
+                with col2:
+                    # Prepare visualizations for PDF
+                    figures_dict = {}
+                    if st.session_state.forecast_results:
+                        # Main forecast plot
+                        try:
+                            models_to_plot = list(st.session_state.forecast_results.keys())
+                            fig, ax = plt.subplots(figsize=(14, 8))
+                            ax.plot(df['Date'], df['Sales'], 'o-', label='Historical Data', 
+                                   color='blue', linewidth=2, markersize=6)
+                            
+                            if len(test_data) > 0:
+                                for model_name in models_to_plot:
+                                    if model_name in st.session_state.forecast_results and len(st.session_state.forecast_results[model_name]['test_forecast']) > 0:
+                                        ax.plot(test_data['Date'], st.session_state.forecast_results[model_name]['test_forecast'],
+                                               '--', label=f'{model_name} (Test)', alpha=0.7, linewidth=2)
+                            
+                            future_dates = pd.date_range(start=df['Date'].iloc[-1] + pd.DateOffset(months=1),
+                                                        periods=forecast_horizon, freq='M')
+                            
+                            for model_name in models_to_plot:
+                                if model_name in st.session_state.forecast_results:
+                                    if 'Ensemble' in model_name:
+                                        ax.plot(future_dates, st.session_state.forecast_results[model_name]['future_forecast'],
+                                               'o-', label=f'{model_name} (Forecast)', alpha=0.9, linewidth=3, markersize=10)
+                                    else:
+                                        ax.plot(future_dates, st.session_state.forecast_results[model_name]['future_forecast'],
+                                               'o--', label=f'{model_name} (Forecast)', alpha=0.8, linewidth=2, markersize=8)
+                            
+                            ax.set_title('Sales Forecast Comparison', fontsize=16, fontweight='bold')
+                            ax.set_xlabel('Date', fontsize=12)
+                            ax.set_ylabel('Sales ($)', fontsize=12)
+                            ax.legend(loc='best')
+                            ax.grid(True, alpha=0.3)
+                            plt.xticks(rotation=45)
+                            plt.tight_layout()
+                            figures_dict['Forecast Comparison'] = fig
+                        except:
+                            pass
+                        
+                        # Time series decomposition
+                        try:
+                            decomp_fig = plot_time_series_decomposition(df)
+                            if decomp_fig:
+                                figures_dict['Time Series Decomposition'] = decomp_fig
+                        except:
+                            pass
+                
+                # Download buttons
+                st.markdown("---")
+                
+                # Get the appropriate LLM text
+                llm_text_for_download = st.session_state.get(f'llm_report_{audience.lower()}', st.session_state.llm_report)
+                
+                # Generate PDF when button is clicked
+                if f'pdf_data_{audience.lower()}' not in st.session_state:
+                    st.session_state[f'pdf_data_{audience.lower()}'] = None
+                
+                # PDF Download
+                if PDF_AVAILABLE:
+                    col_pdf1, col_pdf2 = st.columns([1, 1])
+                    with col_pdf1:
+                        if st.button(f"📄 Generate PDF Report ({audience})", type="primary"):
+                            with st.spinner("Generating PDF report..."):
+                                pdf_data, pdf_error = generate_pdf_report(
+                                    llm_text_for_download,
+                                    st.session_state.model_performance,
+                                    st.session_state.forecast_results,
+                                    data_summary,
+                                    st.session_state.get('supply_chain_metrics', {}),
+                                    audience,
+                                    figures_dict
+                                )
+                                
+                                if pdf_error:
+                                    st.error(pdf_error)
+                                    st.session_state[f'pdf_data_{audience.lower()}'] = None
+                                else:
+                                    st.session_state[f'pdf_data_{audience.lower()}'] = pdf_data
+                                    st.success("✅ PDF report generated!")
+                    
+                    with col_pdf2:
+                        if st.session_state[f'pdf_data_{audience.lower()}']:
+                            st.download_button(
+                                label=f"📥 Download PDF Report - {audience}",
+                                data=st.session_state[f'pdf_data_{audience.lower()}'],
+                                file_name=f"forecast_report_{audience.lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                                mime="application/pdf"
+                            )
+                        else:
+                            st.info("Click 'Generate PDF Report' first")
+                else:
+                    st.warning("PDF generation requires: pip install reportlab Pillow")
+                
+                # TXT Download (fallback)
                 report_text = generate_downloadable_report(
-                    st.session_state.llm_report,
+                    llm_text_for_download,
                     st.session_state.model_performance,
                     st.session_state.forecast_results,
                     data_summary,
@@ -1725,9 +2177,9 @@ if df is not None:
                 )
                 
                 st.download_button(
-                    label="📥 Download Full Report (TXT)",
+                    label=f"📄 Download TXT Report ({audience})",
                     data=report_text,
-                    file_name=f"forecast_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                    file_name=f"forecast_report_{audience.lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
                     mime="text/plain"
                 )
         else:
