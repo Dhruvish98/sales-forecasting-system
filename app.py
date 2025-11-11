@@ -8,6 +8,7 @@ import warnings
 import json
 import io
 import base64
+import re
 from scipy import stats
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.tsa.stattools import adfuller
@@ -943,6 +944,63 @@ def fig_to_image(fig):
     img = PILImage.open(buf)
     return img
 
+def clean_html_for_reportlab(text):
+    """Clean and fix HTML tags for ReportLab Paragraph"""
+    if not text:
+        return ""
+    
+    # First, convert markdown to HTML
+    # Fix markdown-style bold (**text**) to HTML
+    text = re.sub(r'\*\*([^*]+?)\*\*', r'<b>\1</b>', text)
+    
+    # Fix cases where <b> is not properly closed (e.g., <b>text<b> -> <b>text</b>)
+    # This handles the specific error case: <b>To:<b> -> <b>To:</b>
+    while re.search(r'<b>([^<]+?)<b>', text):
+        text = re.sub(r'<b>([^<]+?)<b>', r'<b>\1</b>', text)
+    
+    # Fix cases where <b> appears multiple times without closing
+    # Split by <b> tags and ensure each is properly closed
+    parts = re.split(r'(<b>|</b>)', text)
+    result_parts = []
+    in_bold = False
+    
+    for part in parts:
+        if part == '<b>':
+            if in_bold:
+                result_parts.append('</b>')  # Close previous bold
+            result_parts.append('<b>')
+            in_bold = True
+        elif part == '</b>':
+            result_parts.append('</b>')
+            in_bold = False
+        else:
+            result_parts.append(part)
+    
+    text = ''.join(result_parts)
+    
+    # Ensure all opened <b> tags are closed
+    open_count = text.count('<b>')
+    close_count = text.count('</b>')
+    if open_count > close_count:
+        text += '</b>' * (open_count - close_count)
+    
+    # Escape special characters but preserve our HTML tags
+    # First, temporarily replace our tags
+    text = text.replace('<b>', '___BOLD_START___')
+    text = text.replace('</b>', '___BOLD_END___')
+    text = text.replace('<br/>', '___BR___')
+    text = text.replace('<br>', '___BR___')
+    
+    # Escape HTML entities
+    text = text.replace('&', '&amp;')
+    
+    # Restore our tags
+    text = text.replace('___BOLD_START___', '<b>')
+    text = text.replace('___BOLD_END___', '</b>')
+    text = text.replace('___BR___', '<br/>')
+    
+    return text
+
 def generate_pdf_report(llm_text, model_performance, forecast_results, data_summary, 
                        supply_chain_metrics, audience, figures_dict=None):
     """Generate PDF report with visualizations"""
@@ -1083,24 +1141,46 @@ def generate_pdf_report(llm_text, model_performance, forecast_results, data_summ
     elements.append(PageBreak())
     elements.append(Paragraph("AI-Generated Analysis", heading_style))
     
-    # Split LLM text into paragraphs
-    llm_paragraphs = llm_text.split('\n\n')
+    # Clean and process LLM text
+    cleaned_text = clean_html_for_reportlab(llm_text)
+    
+    # Split LLM text into paragraphs and process each
+    llm_paragraphs = cleaned_text.split('\n\n')
     for para in llm_paragraphs:
         para = para.strip()
-        if para:
-            # Check if it's a heading
-            if para.startswith('**') and para.endswith('**'):
-                para = para.replace('**', '')
-                elements.append(Paragraph(f"<b>{para}</b>", styles['Heading3']))
-            elif para.startswith('#'):
-                para = para.replace('#', '').strip()
-                elements.append(Paragraph(f"<b>{para}</b>", styles['Heading3']))
-            else:
-                # Clean markdown formatting
-                para = para.replace('**', '<b>').replace('**', '</b>')
-                para = para.replace('*', '').replace('_', '')
-                elements.append(Paragraph(para, styles['Normal']))
+        if not para:
+            continue
+            
+        # Further clean the paragraph
+        para = clean_html_for_reportlab(para)
+        
+        # Check if it's a heading (markdown style # or **)
+        if re.match(r'^#+\s+', para) or (para.startswith('**') and para.endswith('**') and len(para) < 100):
+            # Extract heading text
+            heading_text = re.sub(r'^#+\s+', '', para)
+            heading_text = re.sub(r'\*\*', '', heading_text)
+            heading_text = re.sub(r'<[^>]+>', '', heading_text)  # Remove any HTML
+            if heading_text.strip():
+                elements.append(Paragraph(heading_text.strip(), styles['Heading3']))
+                elements.append(Spacer(1, 0.1*inch))
+            continue
+        
+        # Try to add as paragraph with HTML
+        try:
+            elements.append(Paragraph(para, styles['Normal']))
             elements.append(Spacer(1, 0.1*inch))
+        except Exception as e:
+            # Fallback: strip all HTML and use plain text
+            try:
+                plain_text = re.sub(r'<[^>]+>', '', para)
+                plain_text = plain_text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+                plain_text = plain_text.replace('&nbsp;', ' ')
+                if plain_text.strip():
+                    elements.append(Paragraph(plain_text.strip(), styles['Normal']))
+                    elements.append(Spacer(1, 0.1*inch))
+            except:
+                # Last resort: skip problematic paragraphs
+                pass
     
     # Build PDF
     doc.build(elements)
